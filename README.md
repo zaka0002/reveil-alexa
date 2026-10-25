@@ -12,7 +12,7 @@ The easiest way to install it is [JailPortal](https://github.com/zaka0002/jailpo
 - Fires only on a **finished** recognition that **ends with "alexa"**, with word confidence ≥ 0.85. Partial results and "alexa …" in the middle of speech are ignored, which keeps TV and conversation from setting it off.
 - On a hit it releases the mic, opens `com.amazon.dee.app/com.amazon.alexa.voice.VoiceHandsFreeSearchActivity` and beeps, waits until Alexa has stopped listening and speaking, then listens again.
 - Android 10 on the Portal silences a background app's capture every so often. A watchdog sees it (`AudioRecordingConfiguration.isClientSilenced()`) and reopens the mic while an invisible activity is on top for under a second, the only state in which the capture is allowed again. It ignores the first 2.5 s after every reopen, when Vosk tends to hear "alexa" in noise.
-- Starts on boot.
+- Starts on boot and has no home-screen icon: it only runs in the background. Open its status screen (state, last word heard, trigger count) with `adb shell am start -n fr.portal.reveilalexa/.MainActivity`.
 
 Say "Alexa", wait for the beep, then give your command.
 

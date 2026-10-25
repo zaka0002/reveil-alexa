@@ -17,9 +17,11 @@
             android:name=".MainActivity"
             android:exported="true"
             android:launchMode="singleTask">
+            <!-- No LAUNCHER category: the app runs in the background and has no home-screen
+                 icon. Open the status screen with
+                 adb shell am start -n fr.portal.reveilalexa/.MainActivity -->
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
 
