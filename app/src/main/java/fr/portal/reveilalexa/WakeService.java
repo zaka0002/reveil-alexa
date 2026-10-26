@@ -29,7 +29,10 @@ public class WakeService extends Service {
     public static volatile String status = "arrêté";
 
     private static final long REVIVE_MIN_INTERVAL_MS = 10000;
-    private static final long WARMUP_MS = 2500;
+    // Short on purpose: Android 10 can force a mic reopen every ~10 s, and every "Alexa" said
+    // inside this window is lost. The final-result + confidence + utterance-final checks in
+    // VoskDetector are what keep noise out now.
+    private static final long WARMUP_MS = 800;
     private static volatile boolean reopenRequested;
 
     private Thread worker;
@@ -62,6 +65,7 @@ public class WakeService extends Service {
                 .setOngoing(true)
                 .build();
         startForeground(1, n);
+        registerReceiver(turnDone, new android.content.IntentFilter(FALCON_TURN_DONE));
     }
 
     @Override
@@ -78,6 +82,10 @@ public class WakeService extends Service {
     public void onDestroy() {
         stop = true;
         if (worker != null) worker.interrupt();
+        try {
+            unregisterReceiver(turnDone);
+        } catch (IllegalArgumentException ignored) {
+        }
         running = false;
         status = "arrêté";
         super.onDestroy();
@@ -144,7 +152,7 @@ public class WakeService extends Service {
                         long now = SystemClock.elapsedRealtime();
                         if (++frames % 10 == 0 && now - openedAt > 3000) {
                             silentChecks = isSilenced(rec) ? silentChecks + 1 : 0;
-                            if (silentChecks >= 3 && othersRecording() == 0
+                            if (silentChecks >= 3 && othersRecording(rec.getAudioSessionId()) == 0
                                     && now - lastRevive > REVIVE_MIN_INTERVAL_MS) {
                                 status = "micro coupé par Android, reprise…";
                                 journal("micro coupé, reprise via le premier plan");
@@ -226,24 +234,55 @@ public class WakeService extends Service {
         return false;
     }
 
-    /** Active captures by other apps, while our own one is open. */
-    private int othersRecording() {
+    /**
+     * Captures by other apps that actually hear something. Silenced ones don't count: HA Bridge,
+     * for one, keeps a capture open all the time, silenced whenever its dashboard isn't in front.
+     */
+    private int othersRecording(int ownSession) {
         android.media.AudioManager am = getSystemService(android.media.AudioManager.class);
-        int n = am.getActiveRecordingConfigurations().size();
-        return Math.max(0, n - 1);
+        int n = 0;
+        for (android.media.AudioRecordingConfiguration c : am.getActiveRecordingConfigurations()) {
+            if (c.getClientAudioSessionId() == ownSession) continue;
+            if (android.os.Build.VERSION.SDK_INT >= 29 && c.isClientSilenced()) continue;
+            n++;
+        }
+        return n;
     }
 
-    /** Waits until Alexa has stopped listening and speaking (or 60 s), so reviving won't interrupt it. */
+    /**
+     * Waits until Alexa has stopped listening and speaking (or 60 s), so reviving won't interrupt it.
+     * With falcon, its TURN_DONE broadcast ends the turn; a TURN_DONE right after LISTEN is the
+     * known cold-start abort (first turn after falcon's activity was created), so LISTEN is re-fired
+     * once. Either way we then wait for the mic and Alexa's speech to go quiet.
+     */
     private void waitForAlexaDone() {
         android.media.AudioManager am = getSystemService(android.media.AudioManager.class);
         long start = SystemClock.elapsedRealtime();
-        SystemClock.sleep(2000); // let Alexa open its mic
+        if (usingFalcon) {
+            boolean retried = false;
+            while (!stop && SystemClock.elapsedRealtime() - start < 60000) {
+                if (turnDoneAt != 0) {
+                    if (!retried && turnDoneAt - listenAt < FALCON_COLD_ABORT_MS) {
+                        retried = true;
+                        turnDoneAt = 0;
+                        journal("Alexa : échec à froid, nouvelle écoute");
+                        sendFalconListen(this);
+                    } else {
+                        break;
+                    }
+                }
+                SystemClock.sleep(100);
+            }
+        } else {
+            SystemClock.sleep(2000); // let Alexa open its mic
+        }
         int quiet = 0;
         while (!stop && quiet < 3 && SystemClock.elapsedRealtime() - start < 60000) {
-            boolean busy = !am.getActiveRecordingConfigurations().isEmpty();
+            boolean busy = othersRecording(-1) > 0; // our mic is released here
             for (android.media.AudioPlaybackConfiguration p : am.getActivePlaybackConfigurations()) {
                 int usage = p.getAudioAttributes().getUsage();
                 if (usage == android.media.AudioAttributes.USAGE_ASSISTANT
+                        || usage == android.media.AudioAttributes.USAGE_ASSISTANCE_SONIFICATION
                         || usage == android.media.AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE) {
                     busy = true;
                 }
@@ -289,7 +328,55 @@ public class WakeService extends Service {
         return true;
     }
 
+    // Meta's own Alexa client, revived by Immortal / HA Bridge. Preferred over the phone app.
+    static final String FALCON = "com.amazon.alexa.multimodal.falcon";
+    private static final String FALCON_LISTEN = FALCON + ".LISTEN";
+    private static final String FALCON_TURN_DONE = FALCON + ".TURN_DONE";
+    // On Android 10 falcon must be the top activity before LISTEN, or its own capture is
+    // silenced and it hears nothing. Same settle time HA Bridge uses.
+    private static final long FALCON_FOREGROUND_MS = 800;
+    private static final long FALCON_COLD_ABORT_MS = 1500;
+
+    private static volatile long listenAt;
+    private static volatile long turnDoneAt;
+    private boolean usingFalcon;
+
+    private final android.content.BroadcastReceiver turnDone = new android.content.BroadcastReceiver() {
+        @Override
+        public void onReceive(Context c, Intent i) {
+            turnDoneAt = SystemClock.elapsedRealtime();
+        }
+    };
+
+    static boolean hasFalcon(Context ctx) {
+        try {
+            ctx.getPackageManager().getPackageInfo(FALCON, 0);
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    static void sendFalconListen(Context ctx) {
+        listenAt = SystemClock.elapsedRealtime();
+        turnDoneAt = 0;
+        ctx.sendBroadcast(new Intent(FALCON_LISTEN).setPackage(FALCON)
+                .addFlags(Intent.FLAG_RECEIVER_FOREGROUND | Intent.FLAG_INCLUDE_STOPPED_PACKAGES));
+    }
+
+    /** Brings falcon to the front, then (off the calling thread) tells it to listen. */
     static void launchAlexa(Context ctx) {
+        if (hasFalcon(ctx)) {
+            try {
+                ctx.startActivity(new Intent().setClassName(FALCON, FALCON + ".SIMActivity")
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION));
+                new android.os.Handler(android.os.Looper.getMainLooper())
+                        .postDelayed(() -> sendFalconListen(ctx), FALCON_FOREGROUND_MS);
+                return;
+            } catch (Exception e) {
+                Log.w(TAG, "lancement falcon", e);
+            }
+        }
         String[] activities = {
                 "com.amazon.alexa.voice.VoiceHandsFreeSearchActivity",
                 "com.amazon.dee.app.ui.voice.LaunchAlexaActivity",
@@ -308,6 +395,9 @@ public class WakeService extends Service {
     }
 
     private void launchAlexa() {
+        usingFalcon = hasFalcon(this);
+        turnDoneAt = 0; // a stale TURN_DONE from an earlier turn must not end this one early
+        journal(usingFalcon ? "ouverture de l'Alexa de Meta (falcon)" : "ouverture de l'appli Amazon Alexa");
         launchAlexa(this);
     }
 }
